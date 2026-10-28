@@ -1,0 +1,775 @@
+openapi: 3.0.3
+info:
+  title: Warehouse Receiving System API
+  version: 1.0.0
+  description: |
+    REST API for registering inbound deliveries, recording received quantities and tracking stock.
+    Source of truth for business rules is `prd.md` (BR-1..BR-14). Every business rule is enforced
+    by the backend regardless of what the frontend validates.
+
+    **Conventions**
+    - Base path `/api/v1` (health endpoints are at the root).
+    - JSON only. Timestamps are ISO 8601 UTC. Dates are `YYYY-MM-DD`.
+    - Lists are paginated: `page` (default 1), `pageSize` (default 20, max 100).
+    - All errors use the `Error` schema.
+servers:
+  - url: http://localhost:8080
+    description: Docker Compose (web container proxies /api to the API)
+  - url: http://localhost:3000
+    description: API container directly / local dev
+tags:
+  - name: System
+  - name: Auth
+  - name: Products
+  - name: Receiving Documents
+  - name: Receipts
+  - name: Inventory
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Liveness probe (no database check)
+      security: []
+      responses:
+        '200':
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+  /ready:
+    get:
+      tags: [System]
+      summary: Readiness probe (database reachable and migrations applied)
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ready }
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in and obtain a JWT
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: INVALID_CREDENTIALS
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/products:
+    get:
+      tags: [Products]
+      summary: List products (OPERATOR, SUPERVISOR)
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - name: search
+          in: query
+          description: Case-insensitive partial match on SKU or name
+          schema: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Page of products
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Product' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Products]
+      summary: Create product (SUPERVISOR only)
+      description: Also creates the inventory row with on_hand = 0 in the same transaction (FR-PRD-6).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: SKU_ALREADY_EXISTS
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/products/{id}:
+    get:
+      tags: [Products]
+      summary: Product detail
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+      responses:
+        '200':
+          description: Product
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/receiving-documents:
+    get:
+      tags: [Receiving Documents]
+      summary: List receiving documents, newest first
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/DocumentStatus' }
+        - name: search
+          in: query
+          description: Partial match on document number or supplier name
+          schema: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Page of documents
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/DocumentSummary' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Receiving Documents]
+      summary: Create a receiving document in DRAFT (OPERATOR, SUPERVISOR)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentWrite' }
+      responses:
+        '201':
+          description: Created (status DRAFT)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422':
+          description: DUPLICATE_PRODUCT_IN_DOCUMENT or PRODUCT_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/receiving-documents/{id}:
+    get:
+      tags: [Receiving Documents]
+      summary: Document detail with items and receipt history
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+      responses:
+        '200':
+          description: Document
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Receiving Documents]
+      summary: Replace header and items of a DRAFT document (OPERATOR, SUPERVISOR)
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentWrite' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: DOCUMENT_NOT_EDITABLE (status is not DRAFT)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: DUPLICATE_PRODUCT_IN_DOCUMENT or PRODUCT_NOT_FOUND
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/receiving-documents/{id}/open:
+    post:
+      tags: [Receiving Documents]
+      summary: Release a document, DRAFT to OPEN (SUPERVISOR only)
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+      responses:
+        '200':
+          description: Opened
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: INVALID_STATE_TRANSITION
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: DOCUMENT_HAS_NO_ITEMS
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/receiving-documents/{id}/cancel:
+    post:
+      tags: [Receiving Documents]
+      summary: Cancel a DRAFT or OPEN (no receipts) document (SUPERVISOR only)
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelRequest' }
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: INVALID_STATE_TRANSITION
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/receiving-documents/{id}/receipts:
+    post:
+      tags: [Receipts]
+      summary: Record a receipt (partial or full) (OPERATOR, SUPERVISOR)
+      description: |
+        Atomic, idempotent, concurrency-safe. In one transaction the API locks the document, its
+        items and the affected inventory rows, validates every line against the remaining quantity,
+        then writes the receipt, updates received quantities and stock, appends ledger rows and
+        recomputes the document status (COMPLETED only when every item is fully received).
+
+        **Idempotency.** `Idempotency-Key` is mandatory. Replaying the same key with the same payload
+        on the same document returns `200` with header `Idempotent-Replay: true` and changes nothing
+        (the `receipt` part is the stored original; `document` reflects current state). Reusing the key
+        with a different payload or document returns `409 IDEMPOTENCY_KEY_REUSED`.
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReceiptCreate' }
+            example:
+              note: Truck 1 of 2
+              lines:
+                - { itemId: 11, quantity: 40 }
+                - { itemId: 12, quantity: 5 }
+      responses:
+        '201':
+          description: Receipt recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReceiptResult' }
+        '200':
+          description: Idempotent replay of an earlier identical request
+          headers:
+            Idempotent-Replay:
+              schema: { type: string, enum: ['true'] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReceiptResult' }
+        '400':
+          description: VALIDATION_ERROR or IDEMPOTENCY_KEY_REQUIRED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: DOCUMENT_NOT_RECEIVABLE or IDEMPOTENCY_KEY_REUSED
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: OVER_RECEIPT, DUPLICATE_ITEM_IN_RECEIPT or ITEM_NOT_IN_DOCUMENT. Nothing is applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/v1/inventory:
+    get:
+      tags: [Inventory]
+      summary: Current stock per product (includes products with 0)
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - name: search
+          in: query
+          schema: { type: string, maxLength: 100 }
+      responses:
+        '200':
+          description: Page of inventory rows, ordered by SKU
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/InventoryItem' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/inventory-transactions:
+    get:
+      tags: [Inventory]
+      summary: Stock ledger, newest first (read-only)
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - name: productId
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: documentId
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: from
+          in: query
+          description: Inclusive start date (UTC) YYYY-MM-DD
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          description: Inclusive end date (UTC) YYYY-MM-DD
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Page of transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/InventoryTransaction' }
+                  meta: { $ref: '#/components/schemas/PageMeta' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated unique key, 8 to 64 characters `A-Za-z0-9-_` (a UUID is recommended).
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 64
+        pattern: '^[A-Za-z0-9_-]+$'
+
+  responses:
+    BadRequest:
+      description: VALIDATION_ERROR
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: UNAUTHENTICATED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: FORBIDDEN (role not allowed)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: NOT_FOUND
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: RATE_LIMITED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - IDEMPOTENCY_KEY_REQUIRED
+                - UNAUTHENTICATED
+                - INVALID_CREDENTIALS
+                - FORBIDDEN
+                - NOT_FOUND
+                - SKU_ALREADY_EXISTS
+                - INVALID_STATE_TRANSITION
+                - DOCUMENT_NOT_RECEIVABLE
+                - DOCUMENT_NOT_EDITABLE
+                - IDEMPOTENCY_KEY_REUSED
+                - OVER_RECEIPT
+                - DUPLICATE_PRODUCT_IN_DOCUMENT
+                - DOCUMENT_HAS_NO_ITEMS
+                - DUPLICATE_ITEM_IN_RECEIPT
+                - ITEM_NOT_IN_DOCUMENT
+                - PRODUCT_NOT_FOUND
+                - RATE_LIMITED
+                - INTERNAL_ERROR
+                - NOT_READY
+            message: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+                properties:
+                  field: { type: string, example: 'lines[0].quantity' }
+                  issue: { type: string, example: exceeds_remaining }
+                  remaining: { type: integer }
+            requestId: { type: string, format: uuid }
+
+    PageMeta:
+      type: object
+      required: [page, pageSize, total, totalPages]
+      properties:
+        page: { type: integer }
+        pageSize: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+
+    Role:
+      type: string
+      enum: [OPERATOR, SUPERVISOR]
+
+    DocumentStatus:
+      type: string
+      enum: [DRAFT, OPEN, PARTIALLY_RECEIVED, COMPLETED, CANCELLED]
+
+    UserRef:
+      type: object
+      required: [id, fullName]
+      properties:
+        id: { type: integer }
+        fullName: { type: string }
+
+    User:
+      type: object
+      required: [id, username, fullName, role]
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        fullName: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, minLength: 3, maxLength: 50 }
+        password: { type: string, minLength: 8, maxLength: 128, format: password }
+
+    LoginResponse:
+      type: object
+      required: [token, expiresAt, user]
+      properties:
+        token: { type: string }
+        expiresAt: { type: string, format: date-time }
+        user: { $ref: '#/components/schemas/User' }
+
+    ProductCreate:
+      type: object
+      required: [sku, name]
+      properties:
+        sku:
+          type: string
+          description: Trimmed and stored uppercase. 2 to 32 chars of A-Z, 0-9, hyphen; must start with a letter or digit.
+          pattern: '^[A-Za-z0-9][A-Za-z0-9-]{1,31}$'
+          example: abc-100
+        name: { type: string, minLength: 1, maxLength: 120 }
+        unit: { type: string, minLength: 1, maxLength: 16, default: PCS }
+        description: { type: string, maxLength: 500, nullable: true }
+
+    Product:
+      type: object
+      required: [id, sku, name, unit, createdAt]
+      properties:
+        id: { type: integer }
+        sku: { type: string, example: ABC-100 }
+        name: { type: string }
+        unit: { type: string }
+        description: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    DocumentItemWrite:
+      type: object
+      required: [productId, expectedQuantity]
+      properties:
+        productId: { type: integer, minimum: 1 }
+        expectedQuantity: { type: integer, minimum: 1, maximum: 1000000 }
+
+    DocumentWrite:
+      type: object
+      required: [items]
+      properties:
+        supplierName: { type: string, maxLength: 120, nullable: true }
+        expectedDate: { type: string, format: date, nullable: true }
+        notes: { type: string, maxLength: 500, nullable: true }
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/DocumentItemWrite' }
+
+    DocumentItem:
+      type: object
+      required: [id, productId, sku, productName, unit, expectedQuantity, receivedQuantity, remainingQuantity]
+      properties:
+        id: { type: integer }
+        productId: { type: integer }
+        sku: { type: string }
+        productName: { type: string }
+        unit: { type: string }
+        expectedQuantity: { type: integer }
+        receivedQuantity: { type: integer }
+        remainingQuantity: { type: integer }
+
+    DocumentSummary:
+      type: object
+      required: [id, documentNumber, status, itemCount, totalExpected, totalReceived, createdBy, createdAt]
+      properties:
+        id: { type: integer }
+        documentNumber: { type: string, example: RCV-000042 }
+        supplierName: { type: string, nullable: true }
+        expectedDate: { type: string, format: date, nullable: true }
+        status: { $ref: '#/components/schemas/DocumentStatus' }
+        itemCount: { type: integer }
+        totalExpected: { type: integer }
+        totalReceived: { type: integer }
+        createdBy: { $ref: '#/components/schemas/UserRef' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    DocumentDetail:
+      allOf:
+        - $ref: '#/components/schemas/DocumentSummary'
+        - type: object
+          required: [items, receipts]
+          properties:
+            notes: { type: string, nullable: true }
+            cancelReason: { type: string, nullable: true }
+            openedAt: { type: string, format: date-time, nullable: true }
+            completedAt: { type: string, format: date-time, nullable: true }
+            cancelledAt: { type: string, format: date-time, nullable: true }
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/DocumentItem' }
+            receipts:
+              type: array
+              description: Receipt history, newest first
+              items: { $ref: '#/components/schemas/Receipt' }
+
+    CancelRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 255 }
+
+    ReceiptLineWrite:
+      type: object
+      required: [itemId, quantity]
+      properties:
+        itemId: { type: integer, minimum: 1 }
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          description: Must also be <= the item's remaining quantity (checked server-side, BR-1)
+
+    ReceiptCreate:
+      type: object
+      required: [lines]
+      properties:
+        note: { type: string, maxLength: 255, nullable: true }
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/ReceiptLineWrite' }
+
+    ReceiptLine:
+      type: object
+      required: [itemId, productId, sku, quantity, balanceAfter]
+      properties:
+        itemId: { type: integer }
+        productId: { type: integer }
+        sku: { type: string }
+        quantity: { type: integer }
+        balanceAfter:
+          type: integer
+          description: Product on_hand immediately after this line (ledger balance)
+
+    Receipt:
+      type: object
+      required: [id, receiptNumber, documentId, receivedBy, createdAt, lines]
+      properties:
+        id: { type: integer }
+        receiptNumber: { type: string, example: RCP-000007 }
+        documentId: { type: integer }
+        note: { type: string, nullable: true }
+        receivedBy: { $ref: '#/components/schemas/UserRef' }
+        createdAt: { type: string, format: date-time }
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/ReceiptLine' }
+
+    ReceiptResult:
+      type: object
+      required: [receipt, document]
+      properties:
+        receipt: { $ref: '#/components/schemas/Receipt' }
+        document: { $ref: '#/components/schemas/DocumentDetail' }
+
+    InventoryItem:
+      type: object
+      required: [productId, sku, name, unit, onHand, updatedAt]
+      properties:
+        productId: { type: integer }
+        sku: { type: string }
+        name: { type: string }
+        unit: { type: string }
+        onHand: { type: integer, minimum: 0 }
+        updatedAt: { type: string, format: date-time }
+
+    InventoryTransaction:
+      type: object
+      required: [id, createdAt, type, product, quantity, balanceAfter, document, receiptId, createdBy]
+      properties:
+        id: { type: integer }
+        createdAt: { type: string, format: date-time }
+        type: { type: string, enum: [RECEIPT] }
+        product:
+          type: object
+          required: [id, sku, name]
+          properties:
+            id: { type: integer }
+            sku: { type: string }
+            name: { type: string }
+        quantity: { type: integer, description: Signed stock change }
+        balanceAfter: { type: integer }
+        document:
+          type: object
+          required: [id, documentNumber]
+          properties:
+            id: { type: integer }
+            documentNumber: { type: string }
+        receiptId: { type: integer }
+        createdBy: { $ref: '#/components/schemas/UserRef' }
+
+security:
+  - bearerAuth: []

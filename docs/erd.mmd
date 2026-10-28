@@ -1,0 +1,106 @@
+---
+title: Warehouse Receiving System - ERD
+---
+erDiagram
+    users {
+        int id PK
+        string username UK "3-50 chars"
+        string password_hash "bcrypt"
+        string full_name
+        user_role role "OPERATOR | SUPERVISOR"
+        boolean is_active
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    products {
+        int id PK
+        string sku UK "uppercase, immutable"
+        string name
+        string unit "default PCS"
+        string description "nullable"
+        int created_by FK
+        timestamptz created_at
+    }
+
+    inventory {
+        int product_id PK, FK "1:1 with products"
+        int on_hand "CHECK >= 0"
+        timestamptz updated_at
+    }
+
+    receiving_documents {
+        int id PK
+        string document_number UK "RCV-000001, from sequence"
+        string supplier_name "nullable"
+        date expected_date "nullable"
+        string notes "nullable"
+        document_status status "DRAFT|OPEN|PARTIALLY_RECEIVED|COMPLETED|CANCELLED"
+        string cancel_reason "required when CANCELLED"
+        int created_by FK
+        int opened_by FK "nullable"
+        timestamptz opened_at "nullable"
+        int cancelled_by FK "nullable"
+        timestamptz cancelled_at "nullable"
+        timestamptz completed_at "nullable"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    receiving_document_items {
+        int id PK
+        int document_id FK
+        int product_id FK
+        int expected_quantity "CHECK 1..1000000"
+        int received_quantity "CHECK 0 <= received <= expected"
+    }
+
+    receipts {
+        int id PK
+        string receipt_number UK "RCP-000001, from sequence"
+        int document_id FK
+        string idempotency_key UK "globally unique"
+        string request_hash "sha256 of canonical payload"
+        string note "nullable"
+        int received_by FK
+        timestamptz created_at
+    }
+
+    receipt_lines {
+        int id PK
+        int receipt_id FK
+        int item_id FK "receiving_document_items.id"
+        int quantity "CHECK > 0"
+    }
+
+    inventory_transactions {
+        int id PK
+        int product_id FK
+        transaction_type type "RECEIPT"
+        int quantity "signed delta, CHECK <> 0"
+        int balance_after "CHECK >= 0"
+        int document_id FK
+        int receipt_id FK
+        int receipt_line_id FK, UK "1 line = 1 transaction"
+        int created_by FK
+        timestamptz created_at
+    }
+
+    users ||--o{ products : "created_by"
+    users ||--o{ receiving_documents : "created_by / opened_by / cancelled_by"
+    users ||--o{ receipts : "received_by"
+    users ||--o{ inventory_transactions : "created_by"
+
+    products ||--|| inventory : "has balance"
+    products ||--o{ receiving_document_items : "expected in"
+    products ||--o{ inventory_transactions : "ledger"
+
+    receiving_documents ||--|{ receiving_document_items : "contains (UK document_id+product_id)"
+    receiving_documents ||--o{ receipts : "has"
+    receiving_documents ||--o{ inventory_transactions : "source"
+
+    receipts ||--|{ receipt_lines : "contains (UK receipt_id+item_id)"
+    receipts ||--o{ inventory_transactions : "source"
+
+    receiving_document_items ||--o{ receipt_lines : "received via"
+    receipt_lines ||--|| inventory_transactions : "produces"

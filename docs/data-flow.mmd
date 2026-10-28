@@ -1,0 +1,61 @@
+---
+title: Warehouse Receiving System - Data Flow
+---
+flowchart LR
+    subgraph Actors
+        OP([Operator])
+        SV([Supervisor])
+    end
+
+    subgraph Browser["Browser (React SPA)"]
+        UI[Pages and forms<br/>client-side validation only for UX]
+        KEY[Idempotency key<br/>crypto.randomUUID]
+    end
+
+    subgraph WebC["web container (nginx)"]
+        NG[Static files + reverse proxy /api]
+    end
+
+    subgraph ApiC["api container (Express + TypeScript)"]
+        MW[Middleware<br/>requestId, logging, rate limit,<br/>JWT auth, role guard, Zod validation]
+        SVC[Services<br/>ALL business rules:<br/>BR-1..BR-14]
+        REPO[Prisma + raw SQL<br/>FOR UPDATE locks]
+        ERR[Error mapper<br/>uniform error JSON]
+    end
+
+    subgraph DbC["db container (PostgreSQL)"]
+        direction TB
+        T1[(users)]
+        T2[(products)]
+        T3[(inventory<br/>current balance)]
+        T4[(receiving_documents)]
+        T5[(receiving_document_items<br/>received_quantity)]
+        T6[(receipts + receipt_lines<br/>idempotency_key)]
+        T7[(inventory_transactions<br/>append-only ledger)]
+        CK{{CHECK constraints,<br/>unique indexes, triggers}}
+    end
+
+    OP --> UI
+    SV --> UI
+    UI --> KEY
+    KEY -->|Idempotency-Key header| NG
+    UI -->|HTTPS JSON + Bearer JWT| NG
+    NG -->|/api/v1/*| MW
+    MW -->|validated, authorized request| SVC
+    SVC --> REPO
+    REPO -->|single transaction| T4
+    REPO -->|single transaction| T5
+    REPO -->|single transaction| T6
+    REPO -->|single transaction| T3
+    REPO -->|single transaction| T7
+    REPO -.->|read| T1
+    REPO -.->|read| T2
+    CK -.->|second line of defense| T3
+    CK -.-> T5
+    CK -.-> T7
+    SVC -->|AppError| ERR
+    ERR -->|"{error:{code,message,details,requestId}}"| UI
+    SVC -->|result DTO| UI
+
+    classDef rule fill:#fff4d6,stroke:#b8860b
+    class SVC,CK rule
